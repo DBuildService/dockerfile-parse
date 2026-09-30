@@ -311,11 +311,11 @@ class DockerfileParser(object):
         Their value retains the normalized header followed by the literal body
         and terminator lines, joined with newlines and without a final newline.
         """
-        def _rstrip_eol(text, line_continuation_char='\\'):
-            text = text.rstrip()
-            if text.endswith(line_continuation_char):
-                return text[:-1]
-            return text
+        def _continuation_regex(escape):
+            # Docker checks the immediately preceding character, not odd/even
+            # runs of escapes: even three trailing escapes end the instruction.
+            # https://github.com/moby/buildkit/blob/v0.32.2/frontend/dockerfile/parser/parser.go#L158-L168
+            return re.compile(r'(?<!{0}){0}[ \t]*$'.format(re.escape(escape)))
 
         def _create_instruction_dict(instruction=None, value=None):
             return {
@@ -332,9 +332,8 @@ class DockerfileParser(object):
             return line
 
         instructions = []
-        line_continuation_char = '\\'
         insnre = re.compile(r'^\s*(\S+)\s+(.*)$')  # matched group is insn
-        contre = re.compile(r'^.*\\\s*$')          # line continues?
+        contre = _continuation_regex('\\')        # line continues?
         commentre = re.compile(r'^\s*#')           # line is a comment?
         directive_possible = True
         # escape directive regex
@@ -354,8 +353,7 @@ class DockerfileParser(object):
                     # Do the matching twice if there is a directive to avoid doing the matching
                     # for other lines
                     match = escape_directive_re.match(line)
-                    line_continuation_char = match.group(1)
-                    contre = re.compile(r'^.*' + re.escape(match.group(1)) + r'\s*$')
+                    contre = _continuation_regex(match.group(1))
                 elif syntax_directive_re.match(line):
                     # Currently no information for the syntax directive is stored it is still
                     # necessary to detect escape directives after a syntax directive
@@ -373,25 +371,27 @@ class DockerfileParser(object):
                 instructions.append(comment)
 
             else:
+                value = line.rstrip('\r\n')
+                continuation = contre.search(value)
+                value = value[:continuation.start()] if continuation else value.rstrip()
                 if not in_continuation:
                     m = insnre.match(line)
                     if not m:
                         continue
                     current_instruction = _create_instruction_dict(
                         instruction=m.groups()[0].upper(),
-                        value=_rstrip_eol(m.groups()[1], line_continuation_char)
+                        value=value[m.start(2):]
                     )
                 else:
                     current_instruction['content'] += line
                     current_instruction['endline'] = lineno
 
                     if current_instruction['value']:
-                        current_instruction['value'] += _rstrip_eol(line, line_continuation_char)
+                        current_instruction['value'] += value
                     else:
-                        current_instruction['value'] = _rstrip_eol(line.lstrip(),
-                                                                   line_continuation_char)
+                        current_instruction['value'] = value.lstrip()
 
-                in_continuation = contre.match(line)
+                in_continuation = continuation is not None
                 if not in_continuation and current_instruction:
                     heredocs = _heredoc_delimiters(current_instruction['instruction'],
                                                    current_instruction['value'])
