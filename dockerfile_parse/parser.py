@@ -12,6 +12,7 @@ import logging
 import os
 import re
 from contextlib import contextmanager
+from io import StringIO
 from shlex import quote
 
 from .constants import DOCKERFILE_FILENAME, COMMENT_INSTRUCTION
@@ -20,6 +21,73 @@ from .util import (b2u, extract_key_values, get_key_val_dictionary,
 
 
 logger = logging.getLogger(__name__)
+
+
+def _dequote_heredoc(word):
+    """Remove delimiter quotes without expanding variables or shell commands.
+
+    Docker's literal delimiter decoding uses these double-quote escape rules:
+    https://github.com/moby/buildkit/blob/v0.32.2/frontend/dockerfile/shell/lex.go#L315-L330
+    """
+    result = []
+    quote_char = None
+    characters = iter(word)
+    for character in characters:
+        if character == '\\' and quote_char != "'":
+            escaped = next(characters, '')
+            # Docker's double-quote lexer only unescapes these three characters.
+            if quote_char == '"' and escaped not in ('"', '$', '\\'):
+                result.append('\\')
+            result.append(escaped)
+        elif character == quote_char:
+            quote_char = None
+        elif quote_char is None and character in ('"', "'"):
+            quote_char = character
+        else:
+            result.append(character)
+    if quote_char is not None:
+        raise ValueError('Unterminated quote in heredoc delimiter: {0}'.format(word))
+    return ''.join(result)
+
+
+def _heredoc_delimiters(instruction, value):
+    """Return (delimiter, strip_tabs) pairs in the header's declaration order.
+
+    Match Docker's whole-token recognition and whitespace after the operator:
+    https://github.com/moby/buildkit/blob/v0.32.2/frontend/dockerfile/parser/parser.go#L121
+    https://github.com/moby/buildkit/blob/v0.32.2/frontend/dockerfile/shell/lex.go#L516-L532
+    """
+    if instruction == 'ONBUILD':
+        nested = value.split(None, 1)
+        if len(nested) != 2:
+            return []
+        instruction, value = nested
+    if instruction.upper() not in ('RUN', 'COPY', 'ADD') or '<<' not in value:
+        return []
+
+    delimiters = []
+    # Preserve quotes so a literal "<<EOF" cannot become a heredoc opener.
+    words = iter(WordSplitter(value).split(dequote=False, keep_whitespace=True))
+    for word in words:
+        # Docker keeps whitespace immediately after << in the same token.
+        # Whitespace after <<- instead ends the token, as for other words.
+        if re.fullmatch(r'[0-9]*<<', word):
+            separator = next(words, '')
+            if separator not in (' ', '\t', '\r'):
+                continue
+            while separator in (' ', '\t', '\r'):
+                word += separator
+                separator = next(words, '')
+            if separator.isspace():
+                continue
+            word += separator
+        match = re.fullmatch(r'[0-9]*<<(-?)[ \t\n\f\r]*([^<]*)', word)
+        if match:
+            chomp, quoted_delimiter = match.groups()
+            delimiter = _dequote_heredoc(quoted_delimiter)
+            if delimiter:
+                delimiters.append((delimiter, bool(chomp)))
+    return delimiters
 
 
 class KeyValues(dict):
@@ -158,7 +226,8 @@ class DockerfileParser(object):
         :return: list containing lines (unicode) from Dockerfile
         """
         if self.cache_content and self.cached_content:
-            return self.cached_content.splitlines(True)
+            # Match binary readlines(): only LF separates physical lines.
+            return StringIO(self.cached_content).readlines()
 
         try:
             with self._open_dockerfile('rb') as dockerfile:
@@ -237,12 +306,16 @@ class DockerfileParser(object):
              "content": "CMD yum -y update && \\\n    yum clean all\n",
              "value": "yum -y update && yum clean all"}
         ]
+
+        Heredoc content and line bounds include the bodies and terminators.
+        Their value retains the normalized header followed by the literal body
+        and terminator lines, joined with newlines and without a final newline.
         """
-        def _rstrip_eol(text, line_continuation_char='\\'):
-            text = text.rstrip()
-            if text.endswith(line_continuation_char):
-                return text[:-1]
-            return text
+        def _continuation_regex(escape):
+            # Docker checks the immediately preceding character, not odd/even
+            # runs of escapes: even three trailing escapes end the instruction.
+            # https://github.com/moby/buildkit/blob/v0.32.2/frontend/dockerfile/parser/parser.go#L158-L168
+            return re.compile(r'(?<!{0}){0}[ \t]*$'.format(re.escape(escape)))
 
         def _create_instruction_dict(instruction=None, value=None):
             return {
@@ -259,10 +332,8 @@ class DockerfileParser(object):
             return line
 
         instructions = []
-        lineno = -1
-        line_continuation_char = '\\'
         insnre = re.compile(r'^\s*(\S+)\s+(.*)$')  # matched group is insn
-        contre = re.compile(r'^.*\\\s*$')          # line continues?
+        contre = _continuation_regex('\\')        # line continues?
         commentre = re.compile(r'^\s*#')           # line is a comment?
         directive_possible = True
         # escape directive regex
@@ -273,8 +344,8 @@ class DockerfileParser(object):
         in_continuation = False
         current_instruction = {}
 
-        for line in self.lines:
-            lineno += 1
+        lines = iter(enumerate(self.lines))
+        for lineno, line in lines:
 
             if directive_possible:
                 # once support for python versions before 3.8 is dropped use walrus operator
@@ -282,8 +353,7 @@ class DockerfileParser(object):
                     # Do the matching twice if there is a directive to avoid doing the matching
                     # for other lines
                     match = escape_directive_re.match(line)
-                    line_continuation_char = match.group(1)
-                    contre = re.compile(r'^.*' + re.escape(match.group(1)) + r'\s*$')
+                    contre = _continuation_regex(match.group(1))
                 elif syntax_directive_re.match(line):
                     # Currently no information for the syntax directive is stored it is still
                     # necessary to detect escape directives after a syntax directive
@@ -301,26 +371,46 @@ class DockerfileParser(object):
                 instructions.append(comment)
 
             else:
+                value = line.rstrip('\r\n')
+                continuation = contre.search(value)
+                value = value[:continuation.start()] if continuation else value.rstrip()
                 if not in_continuation:
                     m = insnre.match(line)
                     if not m:
                         continue
                     current_instruction = _create_instruction_dict(
                         instruction=m.groups()[0].upper(),
-                        value=_rstrip_eol(m.groups()[1], line_continuation_char)
+                        value=value[m.start(2):]
                     )
                 else:
                     current_instruction['content'] += line
                     current_instruction['endline'] = lineno
 
                     if current_instruction['value']:
-                        current_instruction['value'] += _rstrip_eol(line, line_continuation_char)
+                        current_instruction['value'] += value
                     else:
-                        current_instruction['value'] = _rstrip_eol(line.lstrip(),
-                                                                   line_continuation_char)
+                        current_instruction['value'] = value.lstrip()
 
-                in_continuation = contre.match(line)
+                in_continuation = continuation is not None
                 if not in_continuation and current_instruction:
+                    heredocs = _heredoc_delimiters(current_instruction['instruction'],
+                                                   current_instruction['value'])
+                    for delimiter, strip_tabs in heredocs:
+                        # Bodies are opaque: comments and continuation characters
+                        # have no instruction-level meaning until the terminator.
+                        for lineno, line in lines:
+                            current_instruction['content'] += line
+                            current_instruction['endline'] = lineno
+                            body_line = line.rstrip('\r\n')
+                            current_instruction['value'] += '\n' + body_line
+                            if strip_tabs:
+                                body_line = body_line.lstrip('\t')
+                            if body_line == delimiter:
+                                break
+                        else:
+                            raise ValueError(
+                                'Unterminated heredoc {0!r} starting at line {1}'.format(
+                                    delimiter, current_instruction['startline'] + 1))
                     instructions.append(current_instruction)
 
         return instructions
