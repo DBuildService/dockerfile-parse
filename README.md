@@ -50,6 +50,26 @@ dfp.baseimage = 'centos:7'
 print(dfp.content)
 ```
 
+### Here-documents
+
+The parser groups [Dockerfile here-documents] with their `RUN`, `COPY`, or
+`ADD` instruction, including instructions nested in `ONBUILD`. Quoted
+delimiters, `<<-` tab stripping, and multiple bodies in declaration order
+are supported. Body lines are not parsed as instructions or comments.
+
+Each structure entry's `content` includes its complete heredoc bodies and
+terminators, preserving their whitespace and line endings. Its `startline`
+and `endline` cover the whole block, so inserting after, replacing, or
+deleting the instruction also handles its bodies. The `value` and JSON
+representation contain the normalized header followed by body and terminator
+lines separated by `\n`, without a final newline. An unterminated heredoc
+raises `ValueError` when reading `structure`, including edits that first
+parse the instructions, such as setting `baseimage`. Cached and uncached
+parsing use the same physical line boundaries; literal carriage returns
+within a body do not create additional lines.
+
+[Dockerfile here-documents]: https://docs.docker.com/reference/dockerfile/#here-documents
+
 [coveralls status badge]: https://coveralls.io/repos/containerbuildsystem/dockerfile-parse/badge.svg?branch=master
 [coveralls status link]: https://coveralls.io/r/containerbuildsystem/dockerfile-parse?branch=master
 [lgtm python badge]: https://img.shields.io/lgtm/grade/python/g/containerbuildsystem/dockerfile-parse.svg?logo=lgtm&logoWidth=18

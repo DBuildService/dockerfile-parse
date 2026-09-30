@@ -33,7 +33,7 @@ class WordSplitter(object):
     dequote()
         Returns the string with escaped and quotes consumed
 
-    split(maxsplit=None, dequote=True)
+    split(maxsplit=None, dequote=True, keep_whitespace=False)
         Returns an iterable of words, split at whitespace
     """
 
@@ -100,13 +100,14 @@ class WordSplitter(object):
     def dequote(self):
         return ''.join(self.split(maxsplit=0))
 
-    def split(self, maxsplit=None, dequote=True):
+    def split(self, maxsplit=None, dequote=True, keep_whitespace=False):
         """
         Generator for the words of the string
 
         :param maxsplit: perform at most maxsplit splits;
             if None, do not limit the number of splits
         :param dequote: remove quotes and escape characters once consumed
+        :param keep_whitespace: yield each separator character as a separate item
         """
 
         class Word(object):
@@ -202,6 +203,8 @@ class WordSplitter(object):
                     num_splits += 1
                     yield word.value
 
+                if keep_whitespace:
+                    yield ch
                 word = Word()
             else:
                 word.append(ch)
